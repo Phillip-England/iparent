@@ -88,6 +88,7 @@ type Option struct {
 
 type Child struct {
 	ID            int64
+	Name          string
 	Username      string
 	Points        int
 	Done          int
@@ -329,6 +330,9 @@ func migrate(db *sql.DB) error {
 	if err := ensureColumn(db, "rewards", "image_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := ensureColumn(db, "children", "name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -398,6 +402,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/logout", a.logout)
 	mux.HandleFunc("/admin", a.requireAdmin(a.admin))
 	mux.HandleFunc("/admin/children", a.requireAdmin(a.adminChildren))
+	mux.HandleFunc("/admin/children/name", a.requireAdmin(a.updateChildName))
 	mux.HandleFunc("/admin/challenges", a.requireAdmin(a.adminChallenges))
 	mux.HandleFunc("/admin/challenges/", a.requireAdmin(a.adminChallengeEdit))
 	mux.HandleFunc("/admin/schedules", a.requireAdmin(a.adminSchedules))
@@ -871,15 +876,40 @@ func (a *App) createChild(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	name := strings.TrimSpace(r.FormValue("name"))
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
-	if username == "" || password == "" {
-		a.renderAdminError(w, "admin_children", "Child username and password are required.")
+	if name == "" || username == "" || password == "" {
+		a.renderAdminError(w, "admin_children", "Child name, username, and password are required.")
 		return
 	}
-	_, err := a.db.Exec(`INSERT INTO children (username, password_hash, created_at) VALUES (?, ?, ?)`, username, a.hashPassword(password), time.Now().Unix())
+	_, err := a.db.Exec(`INSERT INTO children (name, username, password_hash, created_at) VALUES (?, ?, ?, ?)`, name, username, a.hashPassword(password), time.Now().Unix())
 	if err != nil {
 		a.renderAdminError(w, "admin_children", "That child username is already in use.")
+		return
+	}
+	http.Redirect(w, r, "/admin/children", http.StatusSeeOther)
+}
+
+func (a *App) updateChildName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	childID, _ := strconv.ParseInt(r.FormValue("child_id"), 10, 64)
+	name := strings.TrimSpace(r.FormValue("name"))
+	if childID < 1 || name == "" {
+		a.renderAdminError(w, "admin_children", "Choose a child and enter their name.")
+		return
+	}
+	result, err := a.db.Exec(`UPDATE children SET name=? WHERE id=?`, name, childID)
+	if err != nil {
+		a.renderAdminError(w, "admin_children", "The child's name could not be saved.")
+		return
+	}
+	updated, _ := result.RowsAffected()
+	if updated != 1 {
+		a.renderAdminError(w, "admin_children", "Child not found.")
 		return
 	}
 	http.Redirect(w, r, "/admin/children", http.StatusSeeOther)
@@ -1155,7 +1185,7 @@ func (a *App) renderAdminError(w http.ResponseWriter, templateName, msg string) 
 func (a *App) childPage(childID int64, message string) (ChildPage, error) {
 	_ = a.runDueSchedules()
 	var child Child
-	err := a.db.QueryRow(`SELECT id, username FROM children WHERE id=?`, childID).Scan(&child.ID, &child.Username)
+	err := a.db.QueryRow(`SELECT id, name, username FROM children WHERE id=?`, childID).Scan(&child.ID, &child.Name, &child.Username)
 	if err != nil {
 		return ChildPage{}, err
 	}
@@ -1205,7 +1235,7 @@ func (a *App) childPage(childID int64, message string) (ChildPage, error) {
 }
 
 func (a *App) children() ([]Child, error) {
-	rows, err := a.db.Query(`SELECT id, username FROM children ORDER BY username`)
+	rows, err := a.db.Query(`SELECT id, name, username FROM children ORDER BY CASE WHEN name='' THEN username ELSE name END`)
 	if err != nil {
 		return nil, err
 	}
@@ -1213,7 +1243,7 @@ func (a *App) children() ([]Child, error) {
 	var out []Child
 	for rows.Next() {
 		var c Child
-		if err := rows.Scan(&c.ID, &c.Username); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Username); err != nil {
 			return nil, err
 		}
 		c.Points = a.childPoints(c.ID)
@@ -2123,10 +2153,11 @@ const html = `
 <section class="grid">
   <section class="panel stack admin-form">
     <h2>Children</h2>
-    {{range .Children}}<div class="card stack"><div class="row"><strong>{{.Username}}</strong><span class="pill points">{{.Points}} pts</span></div><div class="muted small">{{.Done}} / {{.Total}} complete · {{.Percent}}%</div><div class="progress"><span style="width:{{.Percent}}%"></span></div>{{if $.Challenges}}<form class="assign" method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><select name="challenge_id" aria-label="Challenge to give">{{range $.Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select><button>Give</button></form><form method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><button class="secondary">Unlock all</button></form>{{else}}<div class="muted small">Create a challenge before assigning work.</div>{{end}}<form class="stack" method="post" action="/admin/children/home" enctype="multipart/form-data"><input type="hidden" name="child_id" value="{{.ID}}"><label>Homepage note <textarea name="message" placeholder="A note they will see when they sign in">{{.HomeMessage}}</textarea></label>{{if .HomeImagePath}}<img class="reward-thumb" src="{{.HomeImagePath}}" alt="">{{end}}<label>Homepage picture <input name="image" type="file" accept="image/*"></label><button class="secondary">Save homepage</button></form></div>{{else}}<p class="muted">No children yet.</p>{{end}}
+    {{range .Children}}<div class="card stack"><div class="row"><div><strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong><div class="muted small">Username: {{.Username}}</div></div><span class="pill points">{{.Points}} pts</span></div><form class="assign" method="post" action="/admin/children/name"><input type="hidden" name="child_id" value="{{.ID}}"><input name="name" value="{{.Name}}" placeholder="Child's name" aria-label="Child's name" required><button class="secondary">Save name</button></form><div class="muted small">{{.Done}} / {{.Total}} complete · {{.Percent}}%</div><div class="progress"><span style="width:{{.Percent}}%"></span></div>{{if $.Challenges}}<form class="assign" method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><select name="challenge_id" aria-label="Challenge to give">{{range $.Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select><button>Give</button></form><form method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><button class="secondary">Unlock all</button></form>{{else}}<div class="muted small">Create a challenge before assigning work.</div>{{end}}<form class="stack" method="post" action="/admin/children/home" enctype="multipart/form-data"><input type="hidden" name="child_id" value="{{.ID}}"><label>Homepage note <textarea name="message" placeholder="A note they will see when they sign in">{{.HomeMessage}}</textarea></label>{{if .HomeImagePath}}<img class="reward-thumb" src="{{.HomeImagePath}}" alt="">{{end}}<label>Homepage picture <input name="image" type="file" accept="image/*"></label><button class="secondary">Save homepage</button></form></div>{{else}}<p class="muted">No children yet.</p>{{end}}
   </section>
   <form class="panel stack admin-form" method="post" action="/admin/children">
     <h2>Add child</h2>
+    <label>Name <input name="name" autocomplete="name" required></label>
     <label>Username <input name="username" required></label>
     <label>Password <input name="password" type="password" required></label>
     <button>Add child</button>
@@ -2299,7 +2330,7 @@ const html = `
 {{template "layout_bottom" .}}{{end}}
 
 {{define "child_top"}}
-<div class="top"><div><div class="brand">Hi, {{.Child.Username}}</div><div class="muted">{{.Child.Done}} of {{.Child.Total}} assigned challenges complete</div></div><div class="row"><span class="pill points big">{{.Child.Points}} pts</span><a class="btn secondary" href="/logout">Log out</a></div></div>
+<div class="top"><div><div class="brand">Hi, {{if .Child.Name}}{{.Child.Name}}{{else}}{{.Child.Username}}{{end}}</div><div class="muted">{{.Child.Done}} of {{.Child.Total}} assigned challenges complete</div></div><div class="row"><span class="pill points big">{{.Child.Points}} pts</span><a class="btn secondary" href="/logout">Log out</a></div></div>
 <nav class="child-nav"><a href="/child">Open challenges</a><a href="/child/completed">Completed</a><a href="/child/rewards">Rewards</a><a href="/child/history">History</a></nav>
 {{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
 {{end}}
