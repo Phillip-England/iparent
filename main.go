@@ -37,6 +37,7 @@ const (
 	maxFailures      = 5
 	failWindow       = 24 * time.Hour
 	rewardImageMax   = 1 << 20
+	musicUploadMax   = 100 << 20
 )
 
 type Config struct {
@@ -96,6 +97,24 @@ type Child struct {
 	Percent       int
 	HomeMessage   string
 	HomeImagePath string
+	ProfileImage  string
+}
+
+type DirectMessage struct {
+	ID         int64
+	ChildID    int64
+	SenderRole string
+	Body       string
+	CreatedAt  string
+}
+
+type MusicTrack struct {
+	ID        int64
+	Title     string
+	Artist    string
+	FilePath  string
+	FileName  string
+	CreatedAt string
 }
 
 type Reward struct {
@@ -126,11 +145,13 @@ type ChallengeSchedule struct {
 	Frequency      string
 	NextRun        string
 	NextRunUnix    int64
+	StartRunUnix   int64
 	Weekday        int
 	Active         bool
 }
 
 type PointEvent struct {
+	ChildID       int64
 	ChildUsername string
 	Kind          string
 	Title         string
@@ -151,7 +172,30 @@ type AdminPage struct {
 	Schedules     []ChallengeSchedule
 	Events        []PointEvent
 	Pending       []Submission
+	CalendarDays  []CalendarDay
+	DaySchedules  []ChallengeSchedule
+	CalendarTitle string
+	CalendarMonth string
+	PreviousMonth string
+	NextMonth     string
+	SelectedDate  string
+	SelectedLabel string
+	Messages      []DirectMessage
+	SelectedChild Child
+	ParentImage   string
+	Music         []MusicTrack
+	Message       string
 	Error         string
+}
+
+type CalendarDay struct {
+	Date     string
+	Month    string
+	Day      int
+	Count    int
+	InMonth  bool
+	Selected bool
+	Today    bool
 }
 
 type ChildPage struct {
@@ -163,6 +207,10 @@ type ChildPage struct {
 	Purchases           []RewardPurchase
 	Strikes             []StrikeRule
 	Events              []PointEvent
+	Messages            []DirectMessage
+	ParentImage         string
+	Music               []MusicTrack
+	Preview             bool
 	Message             string
 	Error               string
 }
@@ -320,7 +368,11 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS strike_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', points INTEGER NOT NULL, created_at INTEGER NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS strike_events (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL, strike_rule_id INTEGER, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', points_deducted INTEGER NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY(child_id) REFERENCES children(id), FOREIGN KEY(strike_rule_id) REFERENCES strike_rules(id));`,
 		`CREATE TABLE IF NOT EXISTS child_home_settings (child_id INTEGER PRIMARY KEY, message TEXT NOT NULL DEFAULT '', image_path TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(child_id) REFERENCES children(id));`,
-		`CREATE TABLE IF NOT EXISTS challenge_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL, challenge_id INTEGER NOT NULL, frequency TEXT NOT NULL, next_run INTEGER NOT NULL, weekday INTEGER NOT NULL DEFAULT -1, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_run INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(child_id) REFERENCES children(id), FOREIGN KEY(challenge_id) REFERENCES challenges(id));`,
+		`CREATE TABLE IF NOT EXISTS challenge_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL, challenge_id INTEGER NOT NULL, frequency TEXT NOT NULL, next_run INTEGER NOT NULL, start_run INTEGER NOT NULL DEFAULT 0, weekday INTEGER NOT NULL DEFAULT -1, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_run INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(child_id) REFERENCES children(id), FOREIGN KEY(challenge_id) REFERENCES challenges(id));`,
+		`CREATE TABLE IF NOT EXISTS parent_settings (id INTEGER PRIMARY KEY CHECK (id=1), profile_image TEXT NOT NULL DEFAULT '');`,
+		`CREATE TABLE IF NOT EXISTS direct_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL, sender_role TEXT NOT NULL CHECK(sender_role IN ('admin','child')), body TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY(child_id) REFERENCES children(id));`,
+		`CREATE INDEX IF NOT EXISTS idx_direct_messages_child_time ON direct_messages (child_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS music_tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, artist TEXT NOT NULL DEFAULT '', file_path TEXT NOT NULL, file_name TEXT NOT NULL, created_at INTEGER NOT NULL);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -331,6 +383,15 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "children", "name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "children", "profile_image", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "challenge_schedules", "start_run", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE challenge_schedules SET start_run=next_run WHERE start_run=0`); err != nil {
 		return err
 	}
 	return nil
@@ -403,6 +464,14 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin", a.requireAdmin(a.admin))
 	mux.HandleFunc("/admin/children", a.requireAdmin(a.adminChildren))
 	mux.HandleFunc("/admin/children/name", a.requireAdmin(a.updateChildName))
+	mux.HandleFunc("/admin/children/credentials", a.requireAdmin(a.updateChildCredentials))
+	mux.HandleFunc("/admin/children/profile", a.requireAdmin(a.updateChildProfile))
+	mux.HandleFunc("/admin/profile", a.requireAdmin(a.updateParentProfile))
+	mux.HandleFunc("/admin/preview", a.requireAdmin(a.adminChildPreview))
+	mux.HandleFunc("/admin/messages", a.requireAdmin(a.adminMessages))
+	mux.HandleFunc("/admin/messages/delete", a.requireAdmin(a.adminDeleteMessage))
+	mux.HandleFunc("/admin/music", a.requireAdmin(a.adminMusic))
+	mux.HandleFunc("/admin/music/delete", a.requireAdmin(a.adminDeleteMusic))
 	mux.HandleFunc("/admin/challenges", a.requireAdmin(a.adminChallenges))
 	mux.HandleFunc("/admin/challenges/", a.requireAdmin(a.adminChallengeEdit))
 	mux.HandleFunc("/admin/schedules", a.requireAdmin(a.adminSchedules))
@@ -425,21 +494,21 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/child/rewards/buy", a.requireChild(a.childRewardRedeemUnavailable))
 	mux.HandleFunc("/child/points", a.requireChild(a.childPointsHistory))
 	mux.HandleFunc("/child/history", a.requireChild(a.childHistory))
+	mux.HandleFunc("/child/messages", a.requireChild(a.childMessages))
+	mux.HandleFunc("/child/messages/delete", a.requireChild(a.childDeleteMessage))
+	mux.HandleFunc("/child/music", a.requireChild(a.childMusic))
+	mux.HandleFunc("/child/music/stream/", a.requireChild(a.streamMusic))
 	mux.HandleFunc("/child/submit", a.requireChild(a.submitChallenge))
 	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("assets"))))
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("data/uploads"))))
 }
 
 func (a *App) home(w http.ResponseWriter, r *http.Request) {
-	if session, ok := a.currentSession(r); ok {
-		if session.Role == "admin" {
-			http.Redirect(w, r, "/admin", http.StatusSeeOther)
-			return
-		}
-		http.Redirect(w, r, "/child", http.StatusSeeOther)
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
 		return
 	}
-	http.Redirect(w, r, "/login", http.StatusSeeOther)
+	a.render(w, "docs", nil)
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
@@ -506,6 +575,9 @@ func (a *App) adminChildren(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "admin unavailable", http.StatusInternalServerError)
 			return
 		}
+		if r.URL.Query().Get("saved") == "credentials" {
+			page.Message = "Sign-in details updated."
+		}
 		a.render(w, "admin_children", page)
 		return
 	}
@@ -532,6 +604,7 @@ func (a *App) adminSchedules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "schedules unavailable", http.StatusInternalServerError)
 			return
 		}
+		populateScheduleCalendar(&page, r.URL.Query().Get("month"), r.URL.Query().Get("date"), time.Now())
 		a.render(w, "admin_schedules", page)
 		return
 	}
@@ -552,8 +625,68 @@ func (a *App) createChallengeSchedule(w http.ResponseWriter, r *http.Request) {
 		a.renderAdminError(w, "admin_schedules", "Choose a child, challenge, and valid schedule.")
 		return
 	}
-	_, _ = a.db.Exec(`INSERT INTO challenge_schedules (child_id, challenge_id, frequency, next_run, weekday, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)`, childID, challengeID, frequency, nextRun, normalizedWeekday, time.Now().Unix())
-	http.Redirect(w, r, "/admin/schedules", http.StatusSeeOther)
+	_, _ = a.db.Exec(`INSERT INTO challenge_schedules (child_id, challenge_id, frequency, next_run, start_run, weekday, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`, childID, challengeID, frequency, nextRun, nextRun, normalizedWeekday, time.Now().Unix())
+	scheduledDate := time.Unix(nextRun, 0).Format("2006-01-02")
+	http.Redirect(w, r, "/admin/schedules?month="+scheduledDate[:7]+"&date="+scheduledDate, http.StatusSeeOther)
+}
+
+func populateScheduleCalendar(page *AdminPage, monthText, dateText string, now time.Time) {
+	location := now.Location()
+	month, err := time.ParseInLocation("2006-01", monthText, location)
+	if err != nil {
+		month = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, location)
+	}
+	selected, err := time.ParseInLocation("2006-01-02", dateText, location)
+	if err != nil || selected.Year() != month.Year() || selected.Month() != month.Month() {
+		selected = now
+		if selected.Year() != month.Year() || selected.Month() != month.Month() {
+			selected = month
+		}
+	}
+
+	page.CalendarTitle = month.Format("January 2006")
+	page.CalendarMonth = month.Format("2006-01")
+	page.PreviousMonth = month.AddDate(0, -1, 0).Format("2006-01")
+	page.NextMonth = month.AddDate(0, 1, 0).Format("2006-01")
+	page.SelectedDate = selected.Format("2006-01-02")
+	page.SelectedLabel = selected.Format("Monday, January 2")
+	gridStart := month.AddDate(0, 0, -int(month.Weekday()))
+	for i := 0; i < 42; i++ {
+		date := gridStart.AddDate(0, 0, i)
+		day := CalendarDay{
+			Date: date.Format("2006-01-02"), Month: date.Format("2006-01"), Day: date.Day(),
+			InMonth:  date.Month() == month.Month(),
+			Selected: sameDay(date, selected), Today: sameDay(date, now),
+		}
+		for _, schedule := range page.Schedules {
+			if scheduleOccursOn(schedule, date) {
+				day.Count++
+				if day.Selected {
+					page.DaySchedules = append(page.DaySchedules, schedule)
+				}
+			}
+		}
+		page.CalendarDays = append(page.CalendarDays, day)
+	}
+}
+
+func scheduleOccursOn(schedule ChallengeSchedule, date time.Time) bool {
+	run := time.Unix(schedule.NextRunUnix, 0).In(date.Location())
+	if schedule.Frequency == "once" {
+		return sameDay(run, date)
+	}
+	start := time.Unix(schedule.StartRunUnix, 0).In(date.Location())
+	if startOfDay(date).Before(startOfDay(start)) {
+		return false
+	}
+	if schedule.Frequency == "daily" {
+		return true
+	}
+	return schedule.Frequency == "weekly" && int(date.Weekday()) == schedule.Weekday
+}
+
+func sameDay(a, b time.Time) bool {
+	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
 }
 
 func (a *App) adminChallengeEdit(w http.ResponseWriter, r *http.Request) {
@@ -915,6 +1048,216 @@ func (a *App) updateChildName(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/children", http.StatusSeeOther)
 }
 
+func (a *App) updateChildCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	childID, _ := strconv.ParseInt(r.FormValue("child_id"), 10, 64)
+	username := strings.TrimSpace(r.FormValue("username"))
+	password := r.FormValue("password")
+	if childID < 1 || username == "" {
+		a.renderAdminError(w, "admin_children", "Choose a child and enter a username.")
+		return
+	}
+
+	var result sql.Result
+	var err error
+	if password == "" {
+		result, err = a.db.Exec(`UPDATE children SET username=? WHERE id=?`, username, childID)
+	} else {
+		result, err = a.db.Exec(`UPDATE children SET username=?, password_hash=? WHERE id=?`, username, a.hashPassword(password), childID)
+	}
+	if err != nil {
+		a.renderAdminError(w, "admin_children", "That username is already in use.")
+		return
+	}
+	updated, _ := result.RowsAffected()
+	if updated != 1 {
+		a.renderAdminError(w, "admin_children", "Child not found.")
+		return
+	}
+	http.Redirect(w, r, "/admin/children?saved=credentials", http.StatusSeeOther)
+}
+
+func (a *App) updateChildProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, rewardImageMax+64*1024)
+	if err := r.ParseMultipartForm(rewardImageMax); err != nil {
+		a.renderAdminError(w, "admin_children", "Profile pictures must be 1 MB or smaller.")
+		return
+	}
+	childID, _ := strconv.ParseInt(r.FormValue("child_id"), 10, 64)
+	imagePath, err := saveUploadedImage(r, "image", "data/uploads/profiles", "/uploads/profiles")
+	if childID < 1 || err != nil || imagePath == "" {
+		if err == nil {
+			err = errors.New("Choose a profile picture.")
+		}
+		a.renderAdminError(w, "admin_children", err.Error())
+		return
+	}
+	_, _ = a.db.Exec(`UPDATE children SET profile_image=? WHERE id=?`, imagePath, childID)
+	http.Redirect(w, r, "/admin/children", http.StatusSeeOther)
+}
+
+func (a *App) updateParentProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, rewardImageMax+64*1024)
+	if err := r.ParseMultipartForm(rewardImageMax); err != nil {
+		a.renderAdminError(w, "admin_children", "Profile pictures must be 1 MB or smaller.")
+		return
+	}
+	imagePath, err := saveUploadedImage(r, "image", "data/uploads/profiles", "/uploads/profiles")
+	if err != nil || imagePath == "" {
+		if err == nil {
+			err = errors.New("Choose a profile picture.")
+		}
+		a.renderAdminError(w, "admin_children", err.Error())
+		return
+	}
+	_, _ = a.db.Exec(`INSERT INTO parent_settings (id, profile_image) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET profile_image=excluded.profile_image`, imagePath)
+	http.Redirect(w, r, "/admin/children", http.StatusSeeOther)
+}
+
+func (a *App) adminChildPreview(w http.ResponseWriter, r *http.Request) {
+	childID, _ := strconv.ParseInt(r.URL.Query().Get("child_id"), 10, 64)
+	page, err := a.childPage(childID, "")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	page.Preview = true
+	a.render(w, "child_challenges", page)
+}
+
+func (a *App) adminMessages(w http.ResponseWriter, r *http.Request) {
+	childID, _ := strconv.ParseInt(r.FormValue("child_id"), 10, 64)
+	page, err := a.adminPage("")
+	if err != nil {
+		http.Error(w, "messages unavailable", http.StatusInternalServerError)
+		return
+	}
+	if childID == 0 && len(page.Children) > 0 {
+		childID = page.Children[0].ID
+	}
+	for _, child := range page.Children {
+		if child.ID == childID {
+			page.SelectedChild = child
+			break
+		}
+	}
+	if page.SelectedChild.ID == 0 {
+		a.render(w, "admin_messages", page)
+		return
+	}
+	if r.Method == http.MethodPost {
+		body := strings.TrimSpace(r.FormValue("body"))
+		if body != "" {
+			_, _ = a.db.Exec(`INSERT INTO direct_messages (child_id, sender_role, body, created_at) VALUES (?, 'admin', ?, ?)`, childID, body, time.Now().Unix())
+		}
+		http.Redirect(w, r, fmt.Sprintf("/admin/messages?child_id=%d", childID), http.StatusSeeOther)
+		return
+	}
+	page.Messages, err = a.directMessages(childID)
+	if err != nil {
+		http.Error(w, "messages unavailable", http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "admin_messages", page)
+}
+
+func (a *App) adminDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	messageID, _ := strconv.ParseInt(r.FormValue("message_id"), 10, 64)
+	childID, _ := strconv.ParseInt(r.FormValue("child_id"), 10, 64)
+	_, _ = a.db.Exec(`DELETE FROM direct_messages WHERE id=? AND child_id=?`, messageID, childID)
+	http.Redirect(w, r, fmt.Sprintf("/admin/messages?child_id=%d", childID), http.StatusSeeOther)
+}
+
+func (a *App) adminMusic(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, musicUploadMax+64*1024)
+		if err := r.ParseMultipartForm(musicUploadMax); err != nil {
+			a.renderAdminError(w, "admin_music", "Tracks must be 100 MB or smaller.")
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		title := strings.TrimSpace(r.FormValue("title"))
+		artist := strings.TrimSpace(r.FormValue("artist"))
+		file, header, err := r.FormFile("audio")
+		if err != nil || title == "" {
+			a.renderAdminError(w, "admin_music", "Enter a title and choose an audio file.")
+			return
+		}
+		defer file.Close()
+		ext := strings.ToLower(filepath.Ext(header.Filename))
+		allowed := map[string]bool{".mp3": true, ".m4a": true, ".aac": true, ".wav": true, ".ogg": true, ".flac": true, ".opus": true}
+		if !allowed[ext] {
+			a.renderAdminError(w, "admin_music", "Choose an MP3, M4A, AAC, WAV, OGG, FLAC, or Opus audio file.")
+			return
+		}
+		if err := os.MkdirAll("data/music", 0o755); err != nil {
+			http.Error(w, "could not save track", http.StatusInternalServerError)
+			return
+		}
+		path := filepath.Join("data/music", fmt.Sprintf("%d%s", time.Now().UnixNano(), ext))
+		dst, err := os.Create(path)
+		if err != nil {
+			http.Error(w, "could not save track", http.StatusInternalServerError)
+			return
+		}
+		n, copyErr := io.Copy(dst, io.LimitReader(file, musicUploadMax+1))
+		closeErr := dst.Close()
+		if copyErr != nil || closeErr != nil || n > musicUploadMax {
+			_ = os.Remove(path)
+			a.renderAdminError(w, "admin_music", "The audio file could not be saved or was too large.")
+			return
+		}
+		_, err = a.db.Exec(`INSERT INTO music_tracks (title, artist, file_path, file_name, created_at) VALUES (?, ?, ?, ?, ?)`, title, artist, path, filepath.Base(header.Filename), time.Now().Unix())
+		if err != nil {
+			_ = os.Remove(path)
+			http.Error(w, "could not save track", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/admin/music", http.StatusSeeOther)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	page, err := a.adminPage("")
+	if err != nil {
+		http.Error(w, "music unavailable", http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "admin_music", page)
+}
+
+func (a *App) adminDeleteMusic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, _ := strconv.ParseInt(r.FormValue("track_id"), 10, 64)
+	var path string
+	if err := a.db.QueryRow(`SELECT file_path FROM music_tracks WHERE id=?`, id).Scan(&path); err == nil {
+		if _, err := a.db.Exec(`DELETE FROM music_tracks WHERE id=?`, id); err == nil {
+			_ = os.Remove(path)
+		}
+	}
+	http.Redirect(w, r, "/admin/music", http.StatusSeeOther)
+}
+
 func (a *App) createReward(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1081,6 +1424,78 @@ func (a *App) childHistory(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "child_history", page)
 }
 
+func (a *App) childMessages(w http.ResponseWriter, r *http.Request) {
+	session, _ := a.currentSession(r)
+	if r.Method == http.MethodPost {
+		body := strings.TrimSpace(r.FormValue("body"))
+		if body != "" {
+			_, _ = a.db.Exec(`INSERT INTO direct_messages (child_id, sender_role, body, created_at) VALUES (?, 'child', ?, ?)`, session.ChildID, body, time.Now().Unix())
+		}
+		http.Redirect(w, r, "/child/messages", http.StatusSeeOther)
+		return
+	}
+	page, err := a.childPage(session.ChildID, "")
+	if err != nil {
+		http.Error(w, "messages unavailable", http.StatusInternalServerError)
+		return
+	}
+	page.Messages, err = a.directMessages(session.ChildID)
+	if err != nil {
+		http.Error(w, "messages unavailable", http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "child_messages", page)
+}
+
+func (a *App) childDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	session, _ := a.currentSession(r)
+	messageID, _ := strconv.ParseInt(r.FormValue("message_id"), 10, 64)
+	_, _ = a.db.Exec(`DELETE FROM direct_messages WHERE id=? AND child_id=?`, messageID, session.ChildID)
+	http.Redirect(w, r, "/child/messages", http.StatusSeeOther)
+}
+
+func (a *App) childMusic(w http.ResponseWriter, r *http.Request) {
+	session, _ := a.currentSession(r)
+	page, err := a.childPage(session.ChildID, "")
+	if err != nil {
+		http.Error(w, "music unavailable", http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "child_music", page)
+}
+
+func (a *App) streamMusic(w http.ResponseWriter, r *http.Request) {
+	idText := strings.TrimPrefix(r.URL.Path, "/child/music/stream/")
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || id < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	var track MusicTrack
+	if err := a.db.QueryRow(`SELECT title, file_path FROM music_tracks WHERE id=?`, id).Scan(&track.Title, &track.FilePath); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	file, err := os.Open(track.FilePath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("Content-Disposition", "inline")
+	http.ServeContent(w, r, filepath.Base(track.FilePath), info.ModTime(), file)
+}
+
 func (a *App) submitChallenge(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1170,7 +1585,11 @@ func (a *App) adminPage(errMsg string) (AdminPage, error) {
 	if err != nil {
 		return AdminPage{}, err
 	}
-	return AdminPage{Children: children, Challenges: challenges, Rewards: rewards, Strikes: strikes, Schedules: schedules, Events: events, Pending: pending, Error: errMsg}, nil
+	music, err := a.musicTracks()
+	if err != nil {
+		return AdminPage{}, err
+	}
+	return AdminPage{Children: children, Challenges: challenges, Rewards: rewards, Strikes: strikes, Schedules: schedules, Events: events, Pending: pending, ParentImage: a.parentProfileImage(), Music: music, Error: errMsg}, nil
 }
 
 func (a *App) renderAdminError(w http.ResponseWriter, templateName, msg string) {
@@ -1185,7 +1604,7 @@ func (a *App) renderAdminError(w http.ResponseWriter, templateName, msg string) 
 func (a *App) childPage(childID int64, message string) (ChildPage, error) {
 	_ = a.runDueSchedules()
 	var child Child
-	err := a.db.QueryRow(`SELECT id, name, username FROM children WHERE id=?`, childID).Scan(&child.ID, &child.Name, &child.Username)
+	err := a.db.QueryRow(`SELECT id, name, username, profile_image FROM children WHERE id=?`, childID).Scan(&child.ID, &child.Name, &child.Username, &child.ProfileImage)
 	if err != nil {
 		return ChildPage{}, err
 	}
@@ -1231,11 +1650,15 @@ func (a *App) childPage(childID int64, message string) (ChildPage, error) {
 	if err != nil {
 		return ChildPage{}, err
 	}
-	return ChildPage{Child: child, Challenges: active, CompletedChallenges: completed, Rewards: rewards, Purchases: purchases, Strikes: strikes, Events: events, Message: message}, nil
+	music, err := a.musicTracks()
+	if err != nil {
+		return ChildPage{}, err
+	}
+	return ChildPage{Child: child, Challenges: active, CompletedChallenges: completed, Rewards: rewards, Purchases: purchases, Strikes: strikes, Events: events, ParentImage: a.parentProfileImage(), Music: music, Message: message}, nil
 }
 
 func (a *App) children() ([]Child, error) {
-	rows, err := a.db.Query(`SELECT id, name, username FROM children ORDER BY CASE WHEN name='' THEN username ELSE name END`)
+	rows, err := a.db.Query(`SELECT id, name, username, profile_image FROM children ORDER BY CASE WHEN name='' THEN username ELSE name END`)
 	if err != nil {
 		return nil, err
 	}
@@ -1243,7 +1666,7 @@ func (a *App) children() ([]Child, error) {
 	var out []Child
 	for rows.Next() {
 		var c Child
-		if err := rows.Scan(&c.ID, &c.Name, &c.Username); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Username, &c.ProfileImage); err != nil {
 			return nil, err
 		}
 		c.Points = a.childPoints(c.ID)
@@ -1252,6 +1675,50 @@ func (a *App) children() ([]Child, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (a *App) parentProfileImage() string {
+	var path string
+	_ = a.db.QueryRow(`SELECT profile_image FROM parent_settings WHERE id=1`).Scan(&path)
+	return path
+}
+
+func (a *App) directMessages(childID int64) ([]DirectMessage, error) {
+	rows, err := a.db.Query(`SELECT id, child_id, sender_role, body, created_at FROM direct_messages WHERE child_id=? ORDER BY created_at, id`, childID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messages []DirectMessage
+	for rows.Next() {
+		var message DirectMessage
+		var createdAt int64
+		if err := rows.Scan(&message.ID, &message.ChildID, &message.SenderRole, &message.Body, &createdAt); err != nil {
+			return nil, err
+		}
+		message.CreatedAt = time.Unix(createdAt, 0).Format("Jan 2, 3:04 PM")
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
+}
+
+func (a *App) musicTracks() ([]MusicTrack, error) {
+	rows, err := a.db.Query(`SELECT id, title, artist, file_path, file_name, created_at FROM music_tracks ORDER BY LOWER(CASE WHEN artist='' THEN title ELSE artist END), LOWER(title)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tracks []MusicTrack
+	for rows.Next() {
+		var track MusicTrack
+		var createdAt int64
+		if err := rows.Scan(&track.ID, &track.Title, &track.Artist, &track.FilePath, &track.FileName, &createdAt); err != nil {
+			return nil, err
+		}
+		track.CreatedAt = time.Unix(createdAt, 0).Format("Jan 2, 2006")
+		tracks = append(tracks, track)
+	}
+	return tracks, rows.Err()
 }
 
 func (a *App) childHomeSettings(childID int64) (string, string) {
@@ -1455,7 +1922,7 @@ func (a *App) rewardPurchases(childID int64) ([]RewardPurchase, error) {
 }
 
 func (a *App) pendingSubmissions() ([]Submission, error) {
-	rows, err := a.db.Query(`SELECT s.id, ch.username, c.title, s.answer, s.photo_path, c.points, s.created_at FROM submissions s JOIN children ch ON ch.id=s.child_id JOIN challenges c ON c.id=s.challenge_id WHERE s.status='pending' ORDER BY s.created_at`)
+	rows, err := a.db.Query(`SELECT s.id, COALESCE(NULLIF(ch.name, ''), ch.username), c.title, s.answer, s.photo_path, c.points, s.created_at FROM submissions s JOIN children ch ON ch.id=s.child_id JOIN challenges c ON c.id=s.challenge_id WHERE s.status='pending' ORDER BY s.created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1490,7 +1957,7 @@ func uploadPublicPath(path string) string {
 }
 
 func (a *App) challengeSchedules() ([]ChallengeSchedule, error) {
-	rows, err := a.db.Query(`SELECT cs.id, ch.username, c.title, cs.frequency, cs.next_run, cs.weekday, cs.active FROM challenge_schedules cs JOIN children ch ON ch.id=cs.child_id JOIN challenges c ON c.id=cs.challenge_id ORDER BY cs.active DESC, cs.next_run`)
+	rows, err := a.db.Query(`SELECT cs.id, COALESCE(NULLIF(ch.name, ''), ch.username), c.title, cs.frequency, cs.next_run, cs.start_run, cs.weekday, cs.active FROM challenge_schedules cs JOIN children ch ON ch.id=cs.child_id JOIN challenges c ON c.id=cs.challenge_id ORDER BY cs.active DESC, cs.next_run`)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,7 +1966,7 @@ func (a *App) challengeSchedules() ([]ChallengeSchedule, error) {
 	for rows.Next() {
 		var s ChallengeSchedule
 		var active int
-		if err := rows.Scan(&s.ID, &s.ChildUsername, &s.ChallengeTitle, &s.Frequency, &s.NextRunUnix, &s.Weekday, &active); err != nil {
+		if err := rows.Scan(&s.ID, &s.ChildUsername, &s.ChallengeTitle, &s.Frequency, &s.NextRunUnix, &s.StartRunUnix, &s.Weekday, &active); err != nil {
 			return nil, err
 		}
 		s.Active = active == 1
@@ -1545,23 +2012,28 @@ func (a *App) runDueSchedules() error {
 }
 
 func nextScheduleRun(frequency, dateText string, weekday int, now time.Time) (int64, int, error) {
-	switch frequency {
-	case "once":
-		if dateText == "" {
-			return 0, -1, errors.New("missing date")
-		}
-		t, err := time.ParseInLocation("2006-01-02", dateText, time.Local)
+	start := startOfDay(now)
+	if dateText != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", dateText, time.Local)
 		if err != nil {
 			return 0, -1, err
 		}
-		return startOfDay(t).Unix(), -1, nil
+		start = startOfDay(parsed)
+	}
+	switch frequency {
+	case "once":
+		return start.Unix(), -1, nil
 	case "daily":
-		return startOfDay(now).Unix(), -1, nil
+		return start.Unix(), -1, nil
 	case "weekly":
+		if dateText != "" {
+			weekday = int(start.Weekday())
+			return start.Unix(), weekday, nil
+		}
 		if weekday < 0 || weekday > 6 {
 			return 0, -1, errors.New("invalid weekday")
 		}
-		t := startOfDay(now)
+		t := start
 		for int(t.Weekday()) != weekday {
 			t = t.AddDate(0, 0, 1)
 		}
@@ -1658,13 +2130,13 @@ func (a *App) pointEvents(childID int64, limit int) ([]PointEvent, error) {
 	} else {
 		filter = " WHERE s.earns_points=1"
 	}
-	rows, err := a.db.Query(`SELECT ch.username, c.title, s.points_awarded, s.created_at FROM submissions s JOIN children ch ON ch.id=s.child_id JOIN challenges c ON c.id=s.challenge_id`+filter, args...)
+	rows, err := a.db.Query(`SELECT ch.id, COALESCE(NULLIF(ch.name, ''), ch.username), c.title, s.points_awarded, s.created_at FROM submissions s JOIN children ch ON ch.id=s.child_id JOIN challenges c ON c.id=s.challenge_id`+filter, args...)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e PointEvent
-		if err := rows.Scan(&e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
+		if err := rows.Scan(&e.ChildID, &e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1680,13 +2152,13 @@ func (a *App) pointEvents(childID int64, limit int) ([]PointEvent, error) {
 		filter = " WHERE ch.id=?"
 		args = append(args, childID)
 	}
-	rows, err = a.db.Query(`SELECT ch.username, r.title, rp.points_spent, rp.created_at FROM reward_purchases rp JOIN children ch ON ch.id=rp.child_id JOIN rewards r ON r.id=rp.reward_id`+filter, args...)
+	rows, err = a.db.Query(`SELECT ch.id, COALESCE(NULLIF(ch.name, ''), ch.username), r.title, rp.points_spent, rp.created_at FROM reward_purchases rp JOIN children ch ON ch.id=rp.child_id JOIN rewards r ON r.id=rp.reward_id`+filter, args...)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e PointEvent
-		if err := rows.Scan(&e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
+		if err := rows.Scan(&e.ChildID, &e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1703,13 +2175,13 @@ func (a *App) pointEvents(childID int64, limit int) ([]PointEvent, error) {
 		filter = " WHERE ch.id=?"
 		args = append(args, childID)
 	}
-	rows, err = a.db.Query(`SELECT ch.username, pa.reason, pa.amount, pa.created_at FROM point_adjustments pa JOIN children ch ON ch.id=pa.child_id`+filter, args...)
+	rows, err = a.db.Query(`SELECT ch.id, COALESCE(NULLIF(ch.name, ''), ch.username), pa.reason, pa.amount, pa.created_at FROM point_adjustments pa JOIN children ch ON ch.id=pa.child_id`+filter, args...)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e PointEvent
-		if err := rows.Scan(&e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
+		if err := rows.Scan(&e.ChildID, &e.ChildUsername, &e.Title, &e.Amount, &e.CreatedUnix); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1730,13 +2202,13 @@ func (a *App) pointEvents(childID int64, limit int) ([]PointEvent, error) {
 		filter = " WHERE ch.id=?"
 		args = append(args, childID)
 	}
-	rows, err = a.db.Query(`SELECT ch.username, se.title, se.description, se.points_deducted, se.created_at FROM strike_events se JOIN children ch ON ch.id=se.child_id`+filter, args...)
+	rows, err = a.db.Query(`SELECT ch.id, COALESCE(NULLIF(ch.name, ''), ch.username), se.title, se.description, se.points_deducted, se.created_at FROM strike_events se JOIN children ch ON ch.id=se.child_id`+filter, args...)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e PointEvent
-		if err := rows.Scan(&e.ChildUsername, &e.Title, &e.Detail, &e.Amount, &e.CreatedUnix); err != nil {
+		if err := rows.Scan(&e.ChildID, &e.ChildUsername, &e.Title, &e.Detail, &e.Amount, &e.CreatedUnix); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -1752,10 +2224,10 @@ func (a *App) pointEvents(childID int64, limit int) ([]PointEvent, error) {
 		}
 		return events[i].CreatedUnix < events[j].CreatedUnix
 	})
-	balances := map[string]int{}
+	balances := map[int64]int{}
 	for i := range events {
-		balances[events[i].ChildUsername] += events[i].Amount
-		events[i].Balance = balances[events[i].ChildUsername]
+		balances[events[i].ChildID] += events[i].Amount
+		events[i].Balance = balances[events[i].ChildID]
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].CreatedUnix == events[j].CreatedUnix {
@@ -2077,6 +2549,9 @@ const html = `
   <style>
     :root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#18202f;background:#f3f6fb}
     body{margin:0;background:linear-gradient(180deg,#fff 0,#f2fbff 38%,#fff8fb 100%)}#rainbow-webgl{position:fixed;inset:0;width:100vw;height:100vh;z-index:-1;pointer-events:none;opacity:.45}.shell{max-width:1160px;margin:0 auto;padding:24px;position:relative}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}.brand{font-weight:900;font-size:24px}.brand:before{content:"";display:inline-block;width:28px;height:14px;margin-right:8px;border-radius:28px 28px 0 0;background:linear-gradient(90deg,#ff5c77,#ffb23f,#ffe15a,#35c779,#34a7ff,#8b5cf6);vertical-align:middle}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.panel,.card{background:rgba(255,255,255,.94);border:1px solid #dbe2ec;border-radius:8px;padding:16px;box-shadow:0 8px 24px rgba(31,45,70,.06);backdrop-filter:blur(8px)}.panel h2,.card h3{margin:0 0 12px}.stack{display:grid;gap:10px}label{display:grid;gap:5px;font-size:14px;font-weight:650}input,select,textarea,button{font:inherit;border-radius:7px;border:1px solid #c8d2df;padding:10px;background:#fff}textarea{min-height:86px}button,.btn{background:linear-gradient(90deg,#ff5c77,#ffb23f,#35c779,#34a7ff,#8b5cf6);color:#fff;border:0;font-weight:850;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.btn:hover{filter:brightness(.98);box-shadow:0 6px 18px rgba(52,167,255,.2)}.btn.secondary,button.secondary{background:#fff;color:#215cce;border:1px solid #cbd6e4}.muted{color:#657084}.error{background:#fff0f0;border:1px solid #e6b6b6;color:#9a1d1d;padding:10px;border-radius:7px}.notice{background:#edf8f0;border:1px solid #b9dfbd;color:#1f6b2a;padding:10px;border-radius:7px;margin-bottom:14px}.pill{display:inline-flex;align-items:center;gap:4px;padding:4px 9px;border-radius:999px;background:#e9edf4;font-size:12px;font-weight:800;white-space:nowrap}.nav-badge{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;margin-left:6px;padding:0 6px;border-radius:999px;background:#ff5c77;color:#fff;font-size:12px;box-shadow:0 4px 12px rgba(255,92,119,.25)}.points{background:#ffe08a;color:#533800;border:1px solid #f2bf3d;box-shadow:inset 0 -1px 0 rgba(83,56,0,.12)}.points.big{font-size:28px;padding:10px 14px;border-radius:8px}.delta-pos{background:#e8f8ee;color:#17613a;border-color:#b8e4c7}.delta-neg{background:#fff0f0;color:#9a1d1d;border-color:#e6b6b6}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.progress{height:10px;background:#e5ebf3;border-radius:99px;overflow:hidden}.progress span{display:block;height:100%;background:linear-gradient(90deg,#ff5c77,#ffb23f,#ffe15a,#35c779,#34a7ff,#8b5cf6)}.challenge-form{border-top:1px solid #e5e9ef;margin-top:12px;padding-top:12px}.login{max-width:380px;margin:12vh auto}.login .brand{font-size:32px;margin-bottom:14px}.small{font-size:13px}.list{display:grid;gap:10px}.option{display:flex;align-items:center;gap:8px;font-weight:500}.option input{width:auto}.admin-form{align-content:start}.hero{background:linear-gradient(120deg,rgba(32,48,74,.96),rgba(47,111,188,.94) 45%,rgba(124,58,237,.94));color:#fff;border-color:#7c3aed}.hero .muted{color:#edf3ff}.todo{border-left:5px solid #34a7ff}.complete{background:rgba(251,252,253,.95);border:1px solid #e4eaf2;border-radius:8px;padding:12px}.strike{border-left:5px solid #d64545}.assign{display:grid;grid-template-columns:1fr auto;gap:8px}.empty{border:1px dashed #bfcad8;background:rgba(255,255,255,.7);padding:18px;border-radius:8px;text-align:center}.reward{background:rgba(255,250,240,.94);border-color:#f1d083}.child-nav{display:flex;gap:8px;flex-wrap:wrap;margin:-8px 0 18px}.child-nav a{background:rgba(255,255,255,.92);color:#215cce;border:1px solid #cbd6e4;border-radius:7px;padding:9px 11px;text-decoration:none;font-weight:800}.child-nav a:hover{border-color:#8b5cf6;box-shadow:0 4px 16px rgba(139,92,246,.15)}.answer{background:#f3f7fb;border:1px solid #d8e2ee;border-radius:8px;padding:10px}.answer strong{display:block;font-size:12px;text-transform:uppercase;color:#657084;margin-bottom:4px}.completed-link{color:inherit;text-decoration:none}.completed-link:hover{border-color:#215cce;box-shadow:0 8px 24px rgba(33,92,206,.12)}.detail-shell{max-width:760px}.back{margin-bottom:14px}.home-note{display:grid;grid-template-columns:minmax(0,1fr) 180px;gap:16px;align-items:center}.home-note img{width:180px;height:120px;object-fit:cover;border-radius:8px}.reward-img{width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:8px;border:1px solid #ead9a8;background:#fff8df}.reward-pick-img{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #ead9a8;background:#fff8df}.reward-thumb{width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid #ead9a8}.review-photo{width:120px;height:90px;object-fit:cover;border-radius:8px;border:1px solid #d8e2ee;background:#f3f7fb;display:block}.review-photo-link{width:max-content;max-width:100%;display:block}.reward-list{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px}.reward-card{width:190px;padding:12px}.reward-card .row{align-items:flex-start}.action-row{display:flex;justify-content:flex-start}.action-row button{width:auto;min-width:108px;padding:8px 10px}.event-kind{font-size:12px;text-transform:uppercase;font-weight:850;color:#657084}.ledger{display:grid;gap:8px}.ledger-head,.ledger-row{display:grid;grid-template-columns:minmax(0,1fr) 110px 110px;gap:12px;align-items:center}.ledger-head{padding:0 12px;color:#657084;font-size:12px;font-weight:850;text-transform:uppercase}.ledger-row{background:rgba(251,252,253,.95);border:1px solid #e4eaf2;border-radius:8px;padding:12px}.ledger-num{text-align:right;font-weight:850}@media(prefers-reduced-motion:reduce){#rainbow-webgl{display:none}}@media(max-width:640px){.shell{padding:16px}.top{align-items:flex-start}.assign,.row,.home-note{display:grid;justify-content:stretch}.ledger-head{display:none}.ledger-row{grid-template-columns:1fr}.ledger-num{text-align:left}.points.big{font-size:24px;text-align:center}.reward-card{width:150px}.home-note img{width:100%;height:160px}}
+    .calendar-head{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:16px;text-align:center;color:#657084;font-size:12px;font-weight:850}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:6px}.calendar-day{position:relative;min-height:76px;padding:9px;border:1px solid #dbe2ec;border-radius:8px;background:#fff;color:#20304a;text-decoration:none;font-weight:800}.calendar-day:hover{border-color:#215cce;box-shadow:0 5px 14px rgba(33,92,206,.12)}.calendar-day.outside{opacity:.42}.calendar-day.selected{outline:3px solid #34a7ff;border-color:#34a7ff}.calendar-day.today .day-number{background:#215cce;color:#fff}.day-number{display:inline-flex;align-items:center;justify-content:center;width:27px;height:27px;border-radius:50%}.calendar-count{display:block;margin-top:7px;color:#215cce;font-size:12px}.calendar-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px}.calendar-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}@media(max-width:760px){.calendar-layout{grid-template-columns:1fr}.calendar-day{min-height:54px;padding:5px}.calendar-count{font-size:10px}}
+    .avatar{width:52px;height:52px;border-radius:50%;object-fit:cover;border:3px solid #fff;box-shadow:0 3px 12px rgba(31,45,70,.2);background:#dfe8f4}.avatar.small-avatar{width:38px;height:38px}.avatar-placeholder{display:inline-flex;align-items:center;justify-content:center;font-weight:900;color:#215cce;background:#e6efff}.identity{display:flex;align-items:center;gap:12px}.message-list{display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding:4px}.message-bubble{max-width:78%;padding:11px 13px;border-radius:16px;background:#edf1f7;align-self:flex-start}.message-bubble.mine{align-self:flex-end;background:#dcecff}.message-bubble p{margin:0 0 5px;white-space:pre-wrap}.message-delete{display:inline;padding:0;background:none;color:#9a1d1d;font-size:12px;font-weight:700}.docs-shell{max-width:980px;margin:0 auto;padding:32px 20px 80px}.docs-hero{padding:60px 0 40px}.docs-hero h1{font-size:clamp(42px,8vw,76px);margin:0 0 14px}.docs-hero p{font-size:20px;max-width:720px;color:#526176}.docs-section{margin-top:24px}.docs-section h2{font-size:28px}.code{background:#18202f;color:#f5f7fb;padding:16px;border-radius:8px;overflow:auto;white-space:pre-wrap}.preview-banner{display:flex;justify-content:space-between;align-items:center;background:#fff4cf;border:1px solid #edca58;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-weight:800}
+    .music-dock{position:sticky;top:10px;z-index:20;display:grid;grid-template-columns:auto minmax(130px,1fr) auto minmax(100px,260px) auto;align-items:center;gap:10px;margin-bottom:16px;padding:10px 12px;border:1px solid #cbd6e4;border-radius:12px;background:rgba(255,255,255,.96);box-shadow:0 10px 30px rgba(31,45,70,.15);backdrop-filter:blur(12px)}.music-dock[hidden]{display:none}.music-round{width:42px;height:42px;padding:0;border-radius:50%}.music-now{display:grid;min-width:0}.music-now strong,.music-now span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.music-dock input[type=range]{width:100%;padding:0}.listening-room{position:relative;min-height:460px;padding:0;overflow:hidden;background:#080719}.listening-room canvas{position:absolute;inset:0;width:100%;height:100%}.visualizer-overlay{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:flex-start;gap:20px;padding:22px;color:#fff;text-shadow:0 2px 10px #000}.visualizer-overlay .muted{color:#e0e8ff}.visual-controls{display:flex;gap:10px;padding:12px;border-radius:10px;background:rgba(8,7,25,.68);backdrop-filter:blur(8px)}.visual-controls label{min-width:100px}.visual-controls input{padding:0;width:110px}.music-library{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:14px}.music-track{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;text-align:left;background:#fff;color:#18202f;border:1px solid #dbe2ec}.music-track:hover{border-color:#8b5cf6;color:#18202f}.music-track small{display:block;color:#657084}.music-note{display:flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg,#ff5c77,#8b5cf6);color:#fff;font-size:24px}@media(max-width:700px){.music-dock{grid-template-columns:auto 1fr auto}.music-dock input,.music-dock>a{display:none}.visualizer-overlay{display:grid}.visual-controls{flex-wrap:wrap}.listening-room{min-height:520px}}
   </style>
 </head><body><canvas id="rainbow-webgl" aria-hidden="true"></canvas><main class="shell">{{end}}
 {{define "layout_bottom"}}</main><script>
@@ -2128,6 +2603,32 @@ const html = `
 })();
 </script></body></html>{{end}}
 
+{{define "docs"}}{{template "layout_top" .}}
+<div class="docs-shell">
+  <header class="docs-hero"><div class="brand">iparent</div><h1>Turn everyday growth into something visible.</h1><p>A private, self-hosted parent and child portal for challenges, points, rewards, schedules, progress, and family messages.</p></header>
+  <section class="docs-section panel"><h2>What iparent does</h2><div class="grid"><div><h3>Challenges that fit your family</h3><p>Create quizzes, written tasks, photo proof, or manually reviewed activities and schedule them from a calendar.</p></div><div><h3>Motivation with context</h3><p>Award points, offer a reward bank, record adjustments and strikes, and keep a complete history.</p></div><div><h3>A space children enjoy</h3><p>Children get a focused dashboard, private family messages, and a curated music library with an interactive visual listening room.</p></div></div></section>
+  <section class="docs-section panel stack"><h2>Single-binary installation</h2><p>Install Go, clone the project, and build one portable executable:</p><div class="code">git clone &lt;your-iparent-repository&gt;
+cd iparent
+go build -o iparent .
+./iparent init
+./iparent</div><p>Initialization creates <code>config/.env</code>, the SQLite database, and upload storage. Change the generated admin password before exposing the service.</p></section>
+  <section class="docs-section panel stack"><h2>Docker deployment</h2><div class="code">docker build -t iparent .
+mkdir -p config data
+docker run --rm \
+  -v "$PWD/config:/app/config" \
+  -v "$PWD/data:/app/data" \
+  iparent iparent init
+docker run -d --name iparent \
+  -p 8097:8097 \
+  -v "$PWD/config:/app/config" \
+  -v "$PWD/data:/app/data" \
+  iparent</div><p>Keep both mounted directories persistent so credentials, SQLite data, and uploaded pictures survive upgrades.</p></section>
+  <section class="docs-section panel stack"><h2>Putting it on the internet</h2><p>Place iparent behind a TLS-enabled reverse proxy such as Caddy, nginx, or your hosting provider’s HTTPS proxy. Forward traffic to port <code>8097</code>, persist <code>config/</code> and <code>data/</code>, use a strong admin password, and back up the SQLite database.</p><div class="code">your-family.example.com {
+  reverse_proxy 127.0.0.1:8097
+}</div></section>
+</div>
+{{template "layout_bottom" .}}{{end}}
+
 {{define "login"}}{{template "layout_top" .}}
 <section class="login panel">
   <div class="brand">iparent</div>
@@ -2143,9 +2644,10 @@ const html = `
 {{template "layout_bottom" .}}{{end}}
 
 {{define "admin_top"}}
-<div class="top"><div><div class="brand">iparent admin</div><div class="muted">Manage children, challenges, reviews, and rewards.</div></div><a class="btn secondary" href="/logout">Log out</a></div>
-<nav class="child-nav"><a href="/admin/children">Children</a><a href="/admin/challenges">Challenges</a><a href="/admin/schedules">Schedules</a><a href="/admin/review">Review{{if .Pending}}<span class="nav-badge">{{len .Pending}}</span>{{end}}</a><a href="/admin/rewards">Rewards</a><a href="/admin/points">Points</a><a href="/admin/history">History</a><a href="/admin/strikes">Strikes</a></nav>
+<div class="top"><div class="identity">{{if .ParentImage}}<img class="avatar" src="{{.ParentImage}}" alt="Parent profile">{{else}}<span class="avatar avatar-placeholder">P</span>{{end}}<div><div class="brand">iparent admin</div><div class="muted">Manage children, challenges, reviews, and rewards.</div></div></div><a class="btn secondary" href="/logout">Log out</a></div>
+<nav class="child-nav"><a href="/admin/children">Children</a><a href="/admin/messages">Messages</a><a href="/admin/music">Music</a><a href="/admin/challenges">Challenges</a><a href="/admin/schedules">Schedules</a><a href="/admin/review">Review{{if .Pending}}<span class="nav-badge">{{len .Pending}}</span>{{end}}</a><a href="/admin/rewards">Rewards</a><a href="/admin/points">Points</a><a href="/admin/history">History</a><a href="/admin/strikes">Strikes</a></nav>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+{{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
 {{end}}
 
 {{define "admin_children"}}{{template "layout_top" .}}
@@ -2153,7 +2655,7 @@ const html = `
 <section class="grid">
   <section class="panel stack admin-form">
     <h2>Children</h2>
-    {{range .Children}}<div class="card stack"><div class="row"><div><strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong><div class="muted small">Username: {{.Username}}</div></div><span class="pill points">{{.Points}} pts</span></div><form class="assign" method="post" action="/admin/children/name"><input type="hidden" name="child_id" value="{{.ID}}"><input name="name" value="{{.Name}}" placeholder="Child's name" aria-label="Child's name" required><button class="secondary">Save name</button></form><div class="muted small">{{.Done}} / {{.Total}} complete · {{.Percent}}%</div><div class="progress"><span style="width:{{.Percent}}%"></span></div>{{if $.Challenges}}<form class="assign" method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><select name="challenge_id" aria-label="Challenge to give">{{range $.Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select><button>Give</button></form><form method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><button class="secondary">Unlock all</button></form>{{else}}<div class="muted small">Create a challenge before assigning work.</div>{{end}}<form class="stack" method="post" action="/admin/children/home" enctype="multipart/form-data"><input type="hidden" name="child_id" value="{{.ID}}"><label>Homepage note <textarea name="message" placeholder="A note they will see when they sign in">{{.HomeMessage}}</textarea></label>{{if .HomeImagePath}}<img class="reward-thumb" src="{{.HomeImagePath}}" alt="">{{end}}<label>Homepage picture <input name="image" type="file" accept="image/*"></label><button class="secondary">Save homepage</button></form></div>{{else}}<p class="muted">No children yet.</p>{{end}}
+    {{range .Children}}<div class="card stack"><div class="row"><div><strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong><div class="muted small">Username: {{.Username}}</div></div><span class="pill points">{{.Points}} pts</span></div><form class="assign" method="post" action="/admin/children/name"><input type="hidden" name="child_id" value="{{.ID}}"><input name="name" value="{{.Name}}" placeholder="Child's name" aria-label="Child's name" required><button class="secondary">Save name</button></form><form class="stack" method="post" action="/admin/children/credentials"><input type="hidden" name="child_id" value="{{.ID}}"><strong>Sign-in details</strong><label>Username <input name="username" value="{{.Username}}" autocomplete="off" required></label><label>New password <input name="password" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password"></label><button>Update sign-in details</button></form><div class="muted small">{{.Done}} / {{.Total}} complete · {{.Percent}}%</div><div class="progress"><span style="width:{{.Percent}}%"></span></div>{{if $.Challenges}}<form class="assign" method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><select name="challenge_id" aria-label="Challenge to give">{{range $.Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select><button>Give</button></form><form method="post" action="/admin/reset"><input type="hidden" name="child_id" value="{{.ID}}"><button class="secondary">Unlock all</button></form>{{else}}<div class="muted small">Create a challenge before assigning work.</div>{{end}}<form class="stack" method="post" action="/admin/children/home" enctype="multipart/form-data"><input type="hidden" name="child_id" value="{{.ID}}"><label>Homepage note <textarea name="message" placeholder="A note they will see when they sign in">{{.HomeMessage}}</textarea></label>{{if .HomeImagePath}}<img class="reward-thumb" src="{{.HomeImagePath}}" alt="">{{end}}<label>Homepage picture <input name="image" type="file" accept="image/*"></label><button class="secondary">Save homepage</button></form></div>{{else}}<p class="muted">No children yet.</p>{{end}}
   </section>
   <form class="panel stack admin-form" method="post" action="/admin/children">
     <h2>Add child</h2>
@@ -2162,6 +2664,26 @@ const html = `
     <label>Password <input name="password" type="password" required></label>
     <button>Add child</button>
   </form>
+</section>
+<section class="grid" style="margin-top:16px">
+  <form class="panel stack" method="post" action="/admin/profile" enctype="multipart/form-data"><h2>Parent profile picture</h2><div class="identity">{{if .ParentImage}}<img class="avatar" src="{{.ParentImage}}" alt="Parent profile">{{else}}<span class="avatar avatar-placeholder">P</span>{{end}}<span class="muted">Shown in the parent portal and messages.</span></div><label>Choose picture <input name="image" type="file" accept="image/*" required></label><button>Save parent picture</button></form>
+  <section class="panel stack"><h2>Child profiles and previews</h2>{{range .Children}}<div class="card stack"><div class="row"><div class="identity">{{if .ProfileImage}}<img class="avatar" src="{{.ProfileImage}}" alt="">{{else}}<span class="avatar avatar-placeholder">C</span>{{end}}<strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong></div><a class="btn secondary" href="/admin/preview?child_id={{.ID}}">Preview page</a></div><form class="assign" method="post" action="/admin/children/profile" enctype="multipart/form-data"><input type="hidden" name="child_id" value="{{.ID}}"><input name="image" type="file" accept="image/*" aria-label="Profile picture" required><button>Save picture</button></form></div>{{else}}<p class="muted">Add a child to create their profile.</p>{{end}}</section>
+</section>
+{{template "layout_bottom" .}}{{end}}
+
+{{define "admin_messages"}}{{template "layout_top" .}}
+{{template "admin_top" .}}
+<section class="calendar-layout">
+  <aside class="panel stack"><h2>Conversations</h2>{{range .Children}}<a class="card completed-link identity" href="/admin/messages?child_id={{.ID}}">{{if .ProfileImage}}<img class="avatar small-avatar" src="{{.ProfileImage}}" alt="">{{else}}<span class="avatar small-avatar avatar-placeholder">C</span>{{end}}<strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong></a>{{else}}<p class="muted">Add a child to start messaging.</p>{{end}}</aside>
+  <section class="panel stack">{{if .SelectedChild.ID}}<div class="identity">{{if .SelectedChild.ProfileImage}}<img class="avatar" src="{{.SelectedChild.ProfileImage}}" alt="">{{else}}<span class="avatar avatar-placeholder">C</span>{{end}}<div><h2>{{if .SelectedChild.Name}}{{.SelectedChild.Name}}{{else}}{{.SelectedChild.Username}}{{end}}</h2><div class="muted small">Private family conversation</div></div></div><div class="message-list">{{range .Messages}}<div class="message-bubble {{if eq .SenderRole "admin"}}mine{{end}}"><p>{{.Body}}</p><div class="muted small">{{if eq .SenderRole "admin"}}You{{else}}Child{{end}} · {{.CreatedAt}}</div><form method="post" action="/admin/messages/delete"><input type="hidden" name="message_id" value="{{.ID}}"><input type="hidden" name="child_id" value="{{.ChildID}}"><button class="message-delete">Delete</button></form></div>{{else}}<p class="empty">No messages yet. Say hello below.</p>{{end}}</div><form class="assign" method="post" action="/admin/messages"><input type="hidden" name="child_id" value="{{.SelectedChild.ID}}"><input name="body" maxlength="2000" placeholder="Write a message" required><button>Send</button></form>{{else}}<p class="muted">Choose a child to open a conversation.</p>{{end}}</section>
+</section>
+{{template "layout_bottom" .}}{{end}}
+
+{{define "admin_music"}}{{template "layout_top" .}}
+{{template "admin_top" .}}
+<section class="grid">
+  <form class="panel stack admin-form" method="post" action="/admin/music" enctype="multipart/form-data"><h2>Upload a track</h2><label>Song title <input name="title" required></label><label>Artist <input name="artist" placeholder="Optional"></label><label>Audio file <input name="audio" type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus" required></label><div class="muted small">Up to 100 MB. Upload only music you have the right to share with your family.</div><button>Add to her library</button></form>
+  <section class="panel"><div class="row"><h2>Music library</h2><span class="pill">{{len .Music}} tracks</span></div><div class="list" style="margin-top:12px">{{range .Music}}<div class="card row"><div><strong>{{.Title}}</strong>{{if .Artist}}<div class="muted">{{.Artist}}</div>{{end}}<div class="muted small">{{.FileName}} · added {{.CreatedAt}}</div></div><form method="post" action="/admin/music/delete"><input type="hidden" name="track_id" value="{{.ID}}"><button class="secondary">Delete</button></form></div>{{else}}<p class="empty">Upload a track to begin the library.</p>{{end}}</div></section>
 </section>
 {{template "layout_bottom" .}}{{end}}
 
@@ -2203,20 +2725,24 @@ const html = `
 
 {{define "admin_schedules"}}{{template "layout_top" .}}
 {{template "admin_top" .}}
-<section class="grid">
-  <form class="panel stack admin-form" method="post" action="/admin/schedules">
-    <h2>Schedule challenge</h2>
-    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{.Username}}</option>{{end}}</select></label>
-    <label>Challenge <select name="challenge_id" required>{{range .Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select></label>
-    <label>When <select name="frequency"><option value="once">On a specific date</option><option value="daily">Every day</option><option value="weekly">Every week</option></select></label>
-    <label>Date <input name="date" type="date"></label>
-    <label>Weekly day <select name="weekday"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></label>
-    <button>Create schedule</button>
-  </form>
+<section class="calendar-layout">
   <section class="panel">
-    <h2>Scheduled challenges</h2>
-    <div class="list" style="margin-top:12px">{{range .Schedules}}<div class="card"><div class="row"><strong>{{.ChildUsername}} · {{.ChallengeTitle}}</strong>{{if .Active}}<span class="pill points">{{.NextRun}}</span>{{else}}<span class="pill">Done</span>{{end}}</div><div class="muted small">{{.Frequency}}{{if eq .Frequency "weekly"}} · weekday {{.Weekday}}{{end}}</div></div>{{else}}<p class="muted">No schedules yet.</p>{{end}}</div>
+    <div class="calendar-actions"><a class="btn secondary" href="/admin/schedules?month={{.PreviousMonth}}">← Previous</a><h2>{{.CalendarTitle}}</h2><a class="btn secondary" href="/admin/schedules?month={{.NextMonth}}">Next →</a></div>
+    <div class="calendar-head"><span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span></div>
+    <div class="calendar">{{range .CalendarDays}}<a class="calendar-day {{if not .InMonth}}outside{{end}} {{if .Selected}}selected{{end}} {{if .Today}}today{{end}}" href="/admin/schedules?month={{.Month}}&date={{.Date}}"><span class="day-number">{{.Day}}</span>{{if .Count}}<span class="calendar-count">{{.Count}} challenge{{if ne .Count 1}}s{{end}}</span>{{end}}</a>{{end}}</div>
   </section>
+  <aside class="stack">
+    <section class="panel"><h2>{{.SelectedLabel}}</h2><div class="list" style="margin-top:12px">{{range .DaySchedules}}<div class="card"><strong>{{.ChildUsername}}</strong><div>{{.ChallengeTitle}}</div><div class="muted small">{{.Frequency}}</div></div>{{else}}<p class="muted">No challenges scheduled for this day.</p>{{end}}</div></section>
+    <form class="panel stack admin-form" method="post" action="/admin/schedules">
+      <h2>Schedule for this day</h2>
+      <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</option>{{end}}</select></label>
+      <label>Challenge <select name="challenge_id" required>{{range .Challenges}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select></label>
+      <label>Repeat <select name="frequency"><option value="once">Just this day</option><option value="daily">Every day starting here</option><option value="weekly">Every week starting here</option></select></label>
+      <input name="date" type="hidden" value="{{.SelectedDate}}">
+      <input name="weekday" type="hidden" value="0">
+      <button>Schedule challenge</button>
+    </form>
+  </aside>
 </section>
 {{template "layout_bottom" .}}{{end}}
 
@@ -2237,7 +2763,7 @@ const html = `
   </section>
   <form class="panel stack admin-form" method="post" action="/admin/rewards/redeem">
     <h2>Redeem for child</h2>
-    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{.Username}} ({{.Points}} pts)</option>{{end}}</select></label>
+    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}} ({{.Points}} pts)</option>{{end}}</select></label>
     <label>Reward <select name="reward_id" required>{{range .Rewards}}<option value="{{.ID}}">{{.Title}} ({{.Points}} pts)</option>{{end}}</select></label>
     <div class="muted small">When a parent redeems a reward, points are spent from the child's balance and the reward leaves that child's reward bank.</div>
     <button>Redeem reward</button>
@@ -2283,21 +2809,21 @@ const html = `
 <section class="grid">
   <form class="panel stack admin-form" method="post" action="/admin/points/gift">
     <h2>Gift points</h2>
-    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{.Username}} ({{.Points}} pts)</option>{{end}}</select></label>
+    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}} ({{.Points}} pts)</option>{{end}}</select></label>
     <label>Gift amount <input name="amount" type="number" min="1" step="1" required></label>
     <label>Message <input name="reason" placeholder="Nice work today"></label>
     <button>Gift points</button>
   </form>
   <form class="panel stack admin-form" method="post" action="/admin/points/adjust">
     <h2>Adjust points</h2>
-    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{.Username}} ({{.Points}} pts)</option>{{end}}</select></label>
+    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}} ({{.Points}} pts)</option>{{end}}</select></label>
     <label>Amount <input name="amount" type="number" step="1" placeholder="Use negative numbers to remove points" required></label>
     <label>Reason <input name="reason" placeholder="Why are points changing?"></label>
     <button>Save adjustment</button>
   </form>
   <section class="panel">
     <h2>Point balances</h2>
-    <div class="list" style="margin-top:12px">{{range .Children}}<div class="row complete"><strong>{{.Username}}</strong><span class="pill points">{{.Points}} pts</span></div>{{else}}<p class="muted">No children yet.</p>{{end}}</div>
+    <div class="list" style="margin-top:12px">{{range .Children}}<div class="row complete"><strong>{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}}</strong><span class="pill points">{{.Points}} pts</span></div>{{else}}<p class="muted">No children yet.</p>{{end}}</div>
   </section>
 </section>
 {{template "layout_bottom" .}}{{end}}
@@ -2320,7 +2846,7 @@ const html = `
   </form>
   <form class="panel stack admin-form" method="post" action="/admin/strikes/impose">
     <h2>Apply strike</h2>
-    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{.Username}} ({{.Points}} pts)</option>{{end}}</select></label>
+    <label>Child <select name="child_id" required>{{range .Children}}<option value="{{.ID}}">{{if .Name}}{{.Name}}{{else}}{{.Username}}{{end}} ({{.Points}} pts)</option>{{end}}</select></label>
     <label>Strike <select name="strike_id" required>{{range .Strikes}}<option value="{{.ID}}">{{.Title}} (-{{.Points}} pts)</option>{{end}}</select></label>
     <button>Apply strike</button>
   </form>
@@ -2330,8 +2856,25 @@ const html = `
 {{template "layout_bottom" .}}{{end}}
 
 {{define "child_top"}}
-<div class="top"><div><div class="brand">Hi, {{if .Child.Name}}{{.Child.Name}}{{else}}{{.Child.Username}}{{end}}</div><div class="muted">{{.Child.Done}} of {{.Child.Total}} assigned challenges complete</div></div><div class="row"><span class="pill points big">{{.Child.Points}} pts</span><a class="btn secondary" href="/logout">Log out</a></div></div>
-<nav class="child-nav"><a href="/child">Open challenges</a><a href="/child/completed">Completed</a><a href="/child/rewards">Rewards</a><a href="/child/history">History</a></nav>
+{{if .Preview}}<div class="preview-banner"><span>Parent preview — this is what your child sees.</span><a class="btn secondary" href="/admin/children">Back to parent portal</a></div>{{end}}
+<div class="top"><div class="identity">{{if .Child.ProfileImage}}<img class="avatar" src="{{.Child.ProfileImage}}" alt="Profile">{{else}}<span class="avatar avatar-placeholder">C</span>{{end}}<div><div class="brand">Hi, {{if .Child.Name}}{{.Child.Name}}{{else}}{{.Child.Username}}{{end}}</div><div class="muted">{{.Child.Done}} of {{.Child.Total}} assigned challenges complete</div></div></div><div class="row"><span class="pill points big">{{.Child.Points}} pts</span>{{if not .Preview}}<a class="btn secondary" href="/logout">Log out</a>{{end}}</div></div>
+{{if not .Preview}}<nav class="child-nav"><a href="/child">Open challenges</a><a href="/child/music">Music</a><a href="/child/messages">Messages</a><a href="/child/completed">Completed</a><a href="/child/rewards">Rewards</a><a href="/child/history">History</a></nav>{{end}}
+{{if not .Preview}}<div id="music-dock" class="music-dock" hidden><button id="music-toggle" class="music-round" aria-label="Play or pause">▶</button><div class="music-now"><strong id="music-title">Nothing playing</strong><span id="music-artist" class="muted small"></span></div><span id="music-time" class="small">0:00</span><input id="music-seek" type="range" min="0" max="100" value="0" aria-label="Song position"><a class="btn secondary" href="/child/music">Listening room</a><audio id="music-audio" preload="metadata"></audio></div>{{end}}
+{{if not .Preview}}<script>
+document.addEventListener('DOMContentLoaded',()=>{
+  const audio=document.getElementById('music-audio'),dock=document.getElementById('music-dock'),toggle=document.getElementById('music-toggle'),seek=document.getElementById('music-seek'),time=document.getElementById('music-time'),title=document.getElementById('music-title'),artist=document.getElementById('music-artist');
+  if(!audio)return; const key='iparentMusic-{{.Child.ID}}'; let state={}; try{state=JSON.parse(localStorage.getItem(key)||'{}')}catch(e){}
+  const save=()=>{if(!audio.src)return;localStorage.setItem(key,JSON.stringify({src:audio.getAttribute('src'),title:title.textContent,artist:artist.textContent,current:audio.currentTime||0,playing:!audio.paused}))};
+  const clock=s=>{s=Math.max(0,Math.floor(s||0));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+  const load=(src,name,by,play)=>{audio.src=src;title.textContent=name;artist.textContent=by||'';dock.hidden=false;audio.load();if(play)audio.play().catch(()=>{});save()};
+  if(state.src){load(state.src,state.title,state.artist,false);audio.addEventListener('loadedmetadata',()=>{audio.currentTime=Math.min(state.current||0,audio.duration||0);if(state.playing)audio.play().catch(()=>{})},{once:true})}
+  document.querySelectorAll('.music-track').forEach(button=>button.addEventListener('click',()=>load(button.dataset.trackSrc,button.dataset.trackTitle,button.dataset.trackArtist,true)));
+  toggle.addEventListener('click',()=>audio.paused?audio.play():audio.pause()); seek.addEventListener('input',()=>{if(audio.duration)audio.currentTime=audio.duration*(Number(seek.value)/100)});
+  audio.addEventListener('play',()=>{toggle.textContent='❚❚';dock.hidden=false;save()});audio.addEventListener('pause',()=>{toggle.textContent='▶';save()});
+  audio.addEventListener('timeupdate',()=>{seek.value=audio.duration?String(audio.currentTime/audio.duration*100):'0';time.textContent=clock(audio.currentTime);if(Math.floor(audio.currentTime)%2===0)save()});
+  audio.addEventListener('ended',()=>{toggle.textContent='▶';save()});window.addEventListener('pagehide',save);
+});
+</script>{{end}}
 {{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
 {{end}}
 
@@ -2345,7 +2888,7 @@ const html = `
     <div class="row"><h3>{{.Title}}</h3><span class="pill">{{.Points}} pts</span></div>
     <p>{{.Prompt}}</p>
     <div class="muted small">Status: {{.Status}}{{if .Earned}} · earned {{.Earned}}{{end}}</div>
-    <form class="challenge-form stack" method="post" action="/child/submit" enctype="multipart/form-data">
+    <form class="challenge-form stack" method="post" action="/child/submit" enctype="multipart/form-data" {{if $.Preview}}style="display:none"{{end}}>
       <input type="hidden" name="challenge_id" value="{{.ID}}">
       {{if eq .Type "multiple_choice"}}{{range .Options}}<label class="option"><input type="radio" name="answer" value="{{.ID}}" required>{{.Text}}</label>{{end}}{{end}}
       {{if eq .Type "true_false"}}{{range .Options}}<label class="option"><input type="radio" name="answer" value="{{.ID}}" required>{{.Text}}</label>{{end}}{{end}}
@@ -2358,6 +2901,34 @@ const html = `
     </form>
   </article>
   {{else}}<div class="empty">No challenges are ready right now.</div>{{end}}
+</section>
+{{template "layout_bottom" .}}{{end}}
+
+{{define "child_music"}}{{template "layout_top" .}}
+{{template "child_top" .}}
+<section class="listening-room panel"><canvas id="music-visualizer" aria-label="Kaleidoscopic music visualization"></canvas><div class="visualizer-overlay"><div><h2>Listening room</h2><p class="muted">Pick a song below, then shape the colors and motion.</p></div><div class="visual-controls"><label>Color <input id="visual-hue" type="range" min="0" max="360" value="210"></label><label>Symmetry <input id="visual-folds" type="range" min="3" max="16" value="8"></label><label>Motion <input id="visual-speed" type="range" min="1" max="10" value="5"></label></div></div></section>
+<section class="panel" style="margin-top:16px"><div class="row"><div><h2>My music</h2><div class="muted small">Choose a track. The player follows you around the child portal.</div></div><span class="pill">{{len .Music}} tracks</span></div><div class="music-library">{{range .Music}}<button class="music-track" data-track-id="{{.ID}}" data-track-title="{{.Title}}" data-track-artist="{{.Artist}}" data-track-src="/child/music/stream/{{.ID}}"><span class="music-note">♪</span><span><strong>{{.Title}}</strong>{{if .Artist}}<small>{{.Artist}}</small>{{end}}</span><span>Play</span></button>{{else}}<p class="empty">Your parent has not added any songs yet.</p>{{end}}</div></section>
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+ const canvas=document.getElementById('music-visualizer'),gl=canvas&&canvas.getContext('webgl');if(!gl)return;
+ const vertex='attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+ const fragment='precision highp float;uniform vec2 r;uniform float t;uniform float hue;uniform float folds;uniform float pulse;vec3 hsv(float h,float s,float v){vec3 c=clamp(abs(mod(h*6.+vec3(0.,4.,2.),6.)-3.)-1.,0.,1.);return v*mix(vec3(1.),c,s);}void main(){vec2 uv=(gl_FragCoord.xy*2.-r)/min(r.x,r.y);float a=atan(uv.y,uv.x);float rad=length(uv);float wedge=6.283185/folds;a=abs(mod(a,wedge)-wedge*.5);vec2 q=vec2(cos(a),sin(a))*rad;float waves=sin(q.x*14.-t*1.7)+cos(q.y*18.+t)+sin(rad*24.-t*2.3);float glow=.55+.45*sin(waves+rad*8.+pulse*2.);float h=mod(hue+rad*.35+waves*.025,1.);vec3 col=hsv(h,.78,.25+.75*glow);col+=.18/(.04+abs(sin(rad*12.-t)-q.y));gl_FragColor=vec4(col,1.);}';
+ const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);return s},program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vertex));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fragment));gl.linkProgram(program);gl.useProgram(program);
+ const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);const p=gl.getAttribLocation(program,'p');gl.enableVertexAttribArray(p);gl.vertexAttribPointer(p,2,gl.FLOAT,false,0,0);
+ const hue=document.getElementById('visual-hue'),folds=document.getElementById('visual-folds'),speed=document.getElementById('visual-speed'),audio=document.getElementById('music-audio'),settingsKey='iparentVisual-{{.Child.ID}}';try{const saved=JSON.parse(localStorage.getItem(settingsKey)||'{}');if(saved.hue)hue.value=saved.hue;if(saved.folds)folds.value=saved.folds;if(saved.speed)speed.value=saved.speed}catch(e){}
+ [hue,folds,speed].forEach(x=>x.addEventListener('input',()=>localStorage.setItem(settingsKey,JSON.stringify({hue:hue.value,folds:folds.value,speed:speed.value}))));
+ const uniforms={r:gl.getUniformLocation(program,'r'),t:gl.getUniformLocation(program,'t'),hue:gl.getUniformLocation(program,'hue'),folds:gl.getUniformLocation(program,'folds'),pulse:gl.getUniformLocation(program,'pulse')};
+ function draw(ms){const dpr=Math.min(devicePixelRatio||1,1.5),w=Math.max(1,canvas.clientWidth*dpr|0),h=Math.max(1,canvas.clientHeight*dpr|0);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;gl.viewport(0,0,w,h)}const motion=Number(speed.value)/5,playing=audio&&!audio.paused,beat=playing?(0.5+0.5*Math.sin((audio.currentTime||0)*6.2)):0.15;gl.uniform2f(uniforms.r,w,h);gl.uniform1f(uniforms.t,ms*.001*motion);gl.uniform1f(uniforms.hue,Number(hue.value)/360);gl.uniform1f(uniforms.folds,Number(folds.value));gl.uniform1f(uniforms.pulse,beat);gl.drawArrays(gl.TRIANGLES,0,6);requestAnimationFrame(draw)}requestAnimationFrame(draw);
+});
+</script>
+{{template "layout_bottom" .}}{{end}}
+
+{{define "child_messages"}}{{template "layout_top" .}}
+{{template "child_top" .}}
+<section class="panel stack detail-shell">
+  <div class="identity">{{if .ParentImage}}<img class="avatar" src="{{.ParentImage}}" alt="Parent profile">{{else}}<span class="avatar avatar-placeholder">P</span>{{end}}<div><h2>Messages with your parent</h2><div class="muted small">A private place to keep in touch.</div></div></div>
+  <div class="message-list">{{range .Messages}}<div class="message-bubble {{if eq .SenderRole "child"}}mine{{end}}"><p>{{.Body}}</p><div class="muted small">{{if eq .SenderRole "child"}}You{{else}}Parent{{end}} · {{.CreatedAt}}</div><form method="post" action="/child/messages/delete"><input type="hidden" name="message_id" value="{{.ID}}"><button class="message-delete">Delete</button></form></div>{{else}}<p class="empty">No messages yet. Say hello below.</p>{{end}}</div>
+  <form class="assign" method="post" action="/child/messages"><input name="body" maxlength="2000" placeholder="Write a message" required><button>Send</button></form>
 </section>
 {{template "layout_bottom" .}}{{end}}
 
