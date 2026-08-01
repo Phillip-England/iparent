@@ -19,7 +19,7 @@ go run . init
 This creates:
 
 - `config/.env`
-- `data/app.sqlite`
+- `data/main.sqlite`
 - `data/uploads/`
 
 Running `iparent init` again will keep the existing `config/.env` and make sure the database and upload folders exist.

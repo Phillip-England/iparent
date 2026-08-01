@@ -30,7 +30,7 @@ const (
 	defaultEnvPath   = "config/.env"
 	defaultDataDir   = "data"
 	defaultUploadDir = "data/uploads"
-	defaultDBPath    = "../data/app.sqlite"
+	defaultDBPath    = "data/main.sqlite"
 	defaultPort      = "8097"
 	sessionCookie    = "iparent_session"
 	sessionLifetime  = 12 * time.Hour
@@ -47,7 +47,6 @@ type Config struct {
 	DBPath        string
 	Port          string
 	EnvPath       string
-	BaseDir       string
 }
 
 type App struct {
@@ -239,13 +238,13 @@ func main() {
 		if err := initEnvironment(defaultEnvPath); err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("Initialized ./config/.env, ./data/app.sqlite, and ./data/uploads. Start with: iparent\n")
+		fmt.Printf("Initialized ./config/.env, ./data/main.sqlite, and ./data/uploads. Start with: iparent\n")
 		return
 	}
 
 	cfg, err := loadConfig(defaultEnvPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "iparent cannot start: %v\n\nRun `iparent init` from the project directory to create config/.env and data/app.sqlite.\n", err)
+		fmt.Fprintf(os.Stderr, "iparent cannot start: %v\n\nRun `iparent init` from the project directory to create config/.env and data/main.sqlite.\n", err)
 		os.Exit(1)
 	}
 	db, err := sql.Open("sqlite", cfg.DBPath)
@@ -289,7 +288,7 @@ func initEnvironment(envPath string) error {
 	if err != nil {
 		return err
 	}
-	body := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\nDB_PATH=%s\nPORT=%s\n", secret, defaultDBPath, defaultPort)
+	body := fmt.Sprintf("ADMIN_USERNAME=admin\nADMIN_PASSWORD=change-me-now\nSESSION_SECRET=%s\nPORT=%s\n", secret, defaultPort)
 	if err := os.WriteFile(envPath, []byte(body), 0o600); err != nil {
 		return err
 	}
@@ -330,16 +329,15 @@ func loadConfig(envPath string) (Config, error) {
 		AdminUsername: values["ADMIN_USERNAME"],
 		AdminPassword: values["ADMIN_PASSWORD"],
 		SessionSecret: values["SESSION_SECRET"],
-		DBPath:        values["DB_PATH"],
+		DBPath:        defaultDBPath,
 		Port:          values["PORT"],
 		EnvPath:       envPath,
-		BaseDir:       filepath.Dir(envPath),
 	}
-	if cfg.AdminUsername == "" || cfg.AdminPassword == "" || cfg.SessionSecret == "" || cfg.DBPath == "" {
-		return Config{}, errors.New("ADMIN_USERNAME, ADMIN_PASSWORD, SESSION_SECRET, and DB_PATH are required")
+	if cfg.AdminUsername == "" || cfg.AdminPassword == "" || cfg.SessionSecret == "" {
+		return Config{}, errors.New("ADMIN_USERNAME, ADMIN_PASSWORD, and SESSION_SECRET are required")
 	}
 	if !filepath.IsAbs(cfg.DBPath) {
-		cfg.DBPath = filepath.Clean(filepath.Join(cfg.BaseDir, cfg.DBPath))
+		cfg.DBPath = filepath.Clean(cfg.DBPath)
 	}
 	if cfg.Port == "" {
 		cfg.Port = defaultPort
